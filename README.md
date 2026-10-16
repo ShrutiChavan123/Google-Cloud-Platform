@@ -396,9 +396,3 @@ This project provides a healthcare-focused GCP architecture for managing RCM dat
 This project is intended for learning, experimentation, and demonstration of cloud-based healthcare analytics using GCP services.
 
 ---
-
-If you want, I can also generate a second version of this README with:
-- a more executive/portfolio-style tone
-- a shorter project summary for GitHub landing page
-- a slide-ready architecture diagram
-- a deployment checklist tailored for your exact repository structure
