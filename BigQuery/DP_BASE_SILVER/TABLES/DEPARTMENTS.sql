@@ -1,4 +1,4 @@
-CREATE OR REPLACE TABLE  dp-dwh-dev.DP_BASE_SILVER.DEPARTMENTS
+CREATE TABLE IF NOT EXISTS  dp-dwh-dev.DP_BASE_SILVER.DEPARTMENTS
 (
   DEPARTMENT_ID STRING OPTIONS(description="The unique identifier for the department as defined in the master system."),
   SRC_ID STRING OPTIONS(description="The original identifier of the department record from the source system."),
