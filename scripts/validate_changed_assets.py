@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from email import errors
 import re
 import subprocess
 import sys
@@ -253,6 +254,10 @@ def changed_files(base: str, head: str) -> list[Path]:
     )
     return [ROOT / name for name in result.stdout.splitlines()]
 
+def report_validated(relative: Path, asset_type: str) -> None:
+    message = f"{relative} ({asset_type}) validated and meets expected standards."
+    print(f"✅ {message}")
+    print(f"::notice title=Standards validation passed::{message}")
 
 def main() -> int:
     if len(sys.argv) != 3:
@@ -274,10 +279,14 @@ def main() -> int:
 
         relative = path.relative_to(ROOT)
         if path.suffix == ".py":
+            error_count = len(errors)
             try:
                 compile(path.read_text(encoding="utf-8"), str(relative), "exec")
             except (SyntaxError, UnicodeDecodeError) as exc:
                 errors.append(f"{relative}: Python validation failed: {exc}")
+
+            if len(errors) == error_count:
+                report_validated(relative, "Python")
             validated += 1
             continue
 
@@ -286,17 +295,28 @@ def main() -> int:
 
         sql = normalize_sql(path.read_text(encoding="utf-8-sig"))
         parts = relative.parts
+        error_count = len(errors)
+        asset_type = "BigQuery SQL"
 
         if len(parts) == 3 and parts[1] == "DATASETS":
             validate_dataset(path, sql, errors)
+            asset_type = "BigQuery dataset"
         elif len(parts) == 4 and parts[2] == "TABLES":
             validate_table(path, sql, errors)
+            asset_type = "BigQuery table"
         elif len(parts) == 4 and parts[2] == "VIEWS":
             validate_view(path, sql, errors)
+            asset_type = "BigQuery view"
         elif len(parts) == 4 and parts[2] == "ROUTINES":
             validate_routine(path, sql, errors)
+            asset_type = "BigQuery routine"
         else:
-            errors.append(f"{relative}: SQL file is not in a recognized BigQuery asset directory")
+            errors.append(
+                f"{relative}: SQL file is not in a recognized BigQuery asset directory"
+            )
+
+        if len(errors) == error_count:
+            report_validated(relative, asset_type)
         validated += 1
 
     if errors:
