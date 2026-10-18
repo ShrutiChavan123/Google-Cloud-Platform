@@ -158,7 +158,26 @@ jobs:
             gcloud storage cp "$file" "$destination"
           done
 
-    auto-merge:
+  # auto-merge:
+  #   name: Auto-merge after validation and deployment
+  #   needs:
+  #     - validate
+  #     - deploy-dev
+  #   if: >-
+  #     github.event.pull_request.head.repo.full_name == github.repository &&
+  #     needs.validate.result == 'success' &&
+  #     needs.deploy-dev.result == 'success'
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: write
+  #     pull-requests: write
+  #   steps:
+  #     - name: Enable auto-merge
+  #       env:
+  #         GH_TOKEN: ${{ github.token }}
+  #         PR_NUMBER: ${{ github.event.pull_request.number }}
+  #       run: gh pr merge "$PR_NUMBER" --auto --squash
+  auto-merge:
     name: Auto-merge after validation and deployment
     needs:
       - validate
