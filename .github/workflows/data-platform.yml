@@ -35,6 +35,12 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: python scripts/validate_changed_assets.py "$BASE_SHA" "$HEAD_SHA"
+      
+      - name: Validate changed DML batch and execution order
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python scripts/dml_batch.py validate "$BASE_SHA" "$HEAD_SHA"
 
   deploy-dev:
     name: Deploy changed assets to development
@@ -74,6 +80,13 @@ jobs:
           PYTHONUNBUFFERED: "1"
         shell: bash
         run: python scripts/deploy_bigquery.py "$BASE_SHA" "$HEAD_SHA"
+
+      - name: Deploy changed DML in validated order
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: python scripts/dml_batch.py deploy "$BASE_SHA" "$HEAD_SHA"
 
       # - name: Deploy changed BigQuery SQL
       #   env:

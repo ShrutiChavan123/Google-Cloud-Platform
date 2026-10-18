@@ -56,6 +56,7 @@ BACKUP_RE = re.compile(
 
 MUTATION_RE = re.compile(
     rf"^\s*(?P<operation>"
+    rf"CREATE\s+OR\s+REPLACE\s+TABLE|"
     rf"UPDATE|DELETE\s+FROM|TRUNCATE\s+TABLE|INSERT(?:\s+INTO)?|"
     rf"MERGE\s+INTO|ALTER\s+TABLE"
     rf")\s+(?P<target>{SQL_OBJECT})",
@@ -358,6 +359,7 @@ def validate_dml(path: Path, sql: str, errors: list[str]) -> None:
     backups: list[tuple[str, str]] = []
     used_backups: set[int] = set()
     mutation_count = 0
+    last_phase = 0
 
     for statement in statements:
         backup_match = BACKUP_RE.search(statement)
@@ -372,6 +374,10 @@ def validate_dml(path: Path, sql: str, errors: list[str]) -> None:
             if len(backup_parts) < 2 or backup_parts[-2] != "DP_BASE_BACKUP":
                 errors.append(
                     f"{relative}: backup table {backup_name} must be in DP_BASE_BACKUP"
+                )
+            if last_phase > 0:
+                errors.append(
+                    f"{relative}: backup statements must come before all mutations"
                 )
                 continue
 
@@ -391,6 +397,26 @@ def validate_dml(path: Path, sql: str, errors: list[str]) -> None:
 
         mutation_count += 1
         operation = " ".join(mutation_match.group("operation").upper().split())
+
+        if operation in {"CREATE OR REPLACE TABLE", "ALTER TABLE"}:
+            phase = 1
+        elif operation in {"TRUNCATE TABLE", "DELETE FROM"}:
+            phase = 2
+        elif operation.startswith("INSERT"):
+            phase = 3
+        elif operation in {"UPDATE", "MERGE INTO"}:
+            phase = 4
+        else:
+            errors.append(f"{relative}: unsupported mutation {operation}")
+            continue
+
+        if phase < last_phase:
+            errors.append(
+                f"{relative}: {operation} is out of order; expected "
+                "backup -> CREATE OR REPLACE/ALTER -> TRUNCATE/DELETE "
+                "-> INSERT -> UPDATE/MERGE"
+            )
+        last_phase = max(last_phase, phase)
         target_name = canonical_table_name(mutation_match.group("target"))
         target_table = target_name.split(".")[-1]
         matching_backup_index: int | None = None
@@ -500,7 +526,6 @@ def main() -> int:
             validate_routine(path, sql, errors)
             asset_type = "BigQuery routine"
         elif len(parts) == 4 and parts[1] == "DML":
-            validate_dml(path, sql, errors)
             asset_type = "BigQuery DML"
         else:
             errors.append(
