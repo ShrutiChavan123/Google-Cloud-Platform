@@ -163,7 +163,7 @@ The solution uses a Bronze → Silver → Gold model:
 Operational reliability is improved by tracking failures and capturing execution logs across the pipeline.
 
 ### CI/CD Automation
-GitHub and Cloud Build enable consistent deployment and source management for the solution.
+GitHub Actions validates pull requests and deploys changed BigQuery assets to the development project after changes are merged to `master`. Cloud Composer DAGs are synced when a `dags/` directory is present.
 
 ## Core Workflow
 
@@ -310,25 +310,29 @@ gcloud dataproc clusters create healthcare-cluster \
 
 Then submit Spark jobs for cleansing and transformation.
 
-### 9. Deploy via Cloud Build
+### 9. Configure GitHub Actions CI/CD
 
-If using CI/CD, add a `cloudbuild.yaml` file pipeline for automated deployment. Typical stages include:
-- repository checkout
-- validation and lint checks
-- infrastructure provisioning
-- data pipeline deployment
-- DAG validation
-- publish artifacts
+The [data-platform workflow](./.github/workflows/data-platform.yml) runs on relevant pull requests and pushes to `master`:
 
-Example structure:
+- Pull requests validate dataset location and descriptions, uppercase dataset/table/column/routine names, table and column descriptions, and Python syntax.
+- Merging BigQuery SQL changes to `main` deploys only the changed SQL files, in dataset → table → routine order.
+- If Python DAGs are added under `dags/`, the workflow validates them and syncs them to the configured Composer DAG bucket.
+- Deployment targets the development environment only. Production promotion should be added as a separate, approval-protected environment.
 
-```yaml
-steps:
-  - name: 'gcr.io/cloud-builders/gcloud'
-    args: ['services','enable','bigquery.googleapis.com']
-  - name: 'gcr.io/cloud-builders/gcloud'
-    args: ['storage','ls']
-```
+Configure a GitHub environment named `development` under **Settings → Environments**, then add these environment variables under **Settings → Environments → development → Environment variables**:
+
+| Variable | Value |
+| --- | --- |
+| `GCP_PROJECT_ID` | `dp-dwh-dev` for the current SQL definitions |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Full provider resource name, such as `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER` |
+| `GCP_SERVICE_ACCOUNT` | Service-account email that GitHub Actions can impersonate |
+| `COMPOSER_DAGS_BUCKET` | Composer DAG bucket name; required once a Python file exists under `dags/` |
+
+Configure Google Cloud Workload Identity Federation to trust this GitHub repository and allow that identity to impersonate the service account. Grant the service account only the permissions it needs: BigQuery job creation, dataset creation in the deployment project, and data editing on the deployment datasets; add bucket write access for the Composer DAG bucket when DAG deployment is enabled. Do not use a downloaded service-account key.
+
+**Project limitation:** existing SQL contains fully qualified references to `dp-dwh-dev`, so the deployment variable must target that project until those references are parameterized. The workflow deploys changed declarations and rejects destructive `CREATE OR REPLACE TABLE` statements. It does not apply schema or data migrations: `CREATE TABLE IF NOT EXISTS` does not alter an existing table, so handle changes to existing table schemas/data through a separately reviewed and approved migration process.
+
+The validator lives at [`scripts/validate_bigquery.py`](./scripts/validate_bigquery.py). Add new dataset definitions under `BigQuery/DATASETS/`, tables under the appropriate `BigQuery/<DATASET>/TABLES/` directory, and routines under `BigQuery/<DATASET>/ROUTINES/`. Keep each SQL filename aligned with its object name.
 
 ### 10. Validate the Deployment
 

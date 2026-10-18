@@ -1,0 +1,135 @@
+name: Data platform CI/CD
+
+on:
+  pull_request:
+    paths:
+      - "BigQuery/**"
+      - "DataProc/**"
+      - "dags/**"
+      - "scripts/**"
+      - ".github/workflows/data-platform.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "BigQuery/**"
+      - "DataProc/**"
+      - "dags/**"
+      - "scripts/**"
+      - ".github/workflows/data-platform.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate SQL and Python
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate BigQuery conventions
+        run: python scripts/validate_bigquery.py
+
+      - name: Compile Python files
+        shell: bash
+        run: |
+          python -m compileall -q DataProc
+          if [ -d dags ]; then
+            python -m compileall -q dags
+          fi
+
+  deploy-dev:
+    name: Deploy changed assets to development
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: development
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Deploy changed BigQuery assets
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          if [ -z "$GCP_PROJECT_ID" ]; then
+            echo "::error::Set the GCP_PROJECT_ID repository variable."
+            exit 1
+          fi
+
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "::error::Initial branch creation cannot be deployed as a full DDL apply. Merge a reviewed follow-up change."
+            exit 1
+          fi
+
+          mapfile -t changed_sql < <(
+            git diff --name-only --diff-filter=ACMR "$BEFORE_SHA" "$AFTER_SHA" -- BigQuery |
+              grep -E '\.sql$' || true
+          )
+
+          if [ "${#changed_sql[@]}" -eq 0 ]; then
+            echo "No BigQuery SQL files changed."
+            exit 0
+          fi
+
+          deploy_category() {
+            local category="$1"
+            local file
+            for file in "${changed_sql[@]}"; do
+              case "$category:$file" in
+                dataset:BigQuery/DATASETS/*.sql|table:BigQuery/*/TABLES/*.sql|routine:BigQuery/*/ROUTINES/*.sql)
+                  if [[ "$file" == BigQuery/DATASETS/*.sql && "$category" == dataset ]] ||
+                     [[ "$file" == BigQuery/*/TABLES/*.sql && "$category" == table ]] ||
+                     [[ "$file" == BigQuery/*/ROUTINES/*.sql && "$category" == routine ]]; then
+                    echo "Deploying $file"
+                    bq query \
+                      --project_id="$GCP_PROJECT_ID" \
+                      --use_legacy_sql=false \
+                      < "$file"
+                  fi
+                  ;;
+              esac
+            done
+          }
+
+          deploy_category dataset
+          deploy_category table
+          deploy_category routine
+
+      - name: Sync Composer DAGs when present
+        if: ${{ hashFiles('dags/**/*.py') != '' }}
+        shell: bash
+        env:
+          COMPOSER_DAGS_BUCKET: ${{ vars.COMPOSER_DAGS_BUCKET }}
+        run: |
+          if [ -z "$COMPOSER_DAGS_BUCKET" ]; then
+            echo "::error::Set the COMPOSER_DAGS_BUCKET repository variable before adding DAGs."
+            exit 1
+          fi
+          gcloud storage rsync --recursive dags "gs://${COMPOSER_DAGS_BUCKET}"
