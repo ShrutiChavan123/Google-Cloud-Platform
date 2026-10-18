@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from datetime import datetime
 from email import errors
 import re
 import subprocess
@@ -43,6 +43,104 @@ COMMENTED_SQL_RE = re.compile(
     r")",
     re.IGNORECASE | re.MULTILINE | re.DOTALL,
 )
+
+SQL_OBJECT = r"(?:`[^`]+`|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){0,2})"
+
+BACKUP_RE = re.compile(
+    rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:SNAPSHOT\s+)?TABLE\s+"
+    rf"(?:IF\s+NOT\s+EXISTS\s+)?(?P<backup>{SQL_OBJECT})\s+"
+    rf"(?:CLONE\s+(?P<clone>{SQL_OBJECT})|"
+    rf"AS\s+SELECT\b.*?\bFROM\s+(?P<source>{SQL_OBJECT}))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+MUTATION_RE = re.compile(
+    rf"^\s*(?P<operation>"
+    rf"UPDATE|DELETE\s+FROM|TRUNCATE\s+TABLE|INSERT(?:\s+INTO)?|"
+    rf"MERGE\s+INTO|ALTER\s+TABLE"
+    rf")\s+(?P<target>{SQL_OBJECT})",
+    re.IGNORECASE,
+)
+
+
+def strip_sql_comments(sql: str) -> str:
+    result: list[str] = []
+    quote: str | None = None
+    i = 0
+
+    while i < len(sql):
+        char = sql[i]
+
+        if quote:
+            result.append(char)
+            if char == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote:
+                    result.append(sql[i + 1])
+                    i += 1
+                else:
+                    quote = None
+            elif char == "\\" and i + 1 < len(sql):
+                result.append(sql[i + 1])
+                i += 1
+        elif char in ("'", '"', "`"):
+            quote = char
+            result.append(char)
+        elif sql.startswith("--", i):
+            while i < len(sql) and sql[i] not in "\r\n":
+                i += 1
+            result.append(" ")
+            continue
+        elif sql.startswith("/*", i):
+            i += 2
+            while i < len(sql) and not sql.startswith("*/", i):
+                if sql[i] in "\r\n":
+                    result.append(sql[i])
+                i += 1
+            i += 2
+            result.append(" ")
+            continue
+        else:
+            result.append(char)
+
+        i += 1
+
+    return "".join(result)
+
+
+def split_sql_statements(sql: str) -> list[str]:
+    statements: list[str] = []
+    start = 0
+    quote: str | None = None
+    i = 0
+
+    while i < len(sql):
+        char = sql[i]
+        if quote:
+            if char == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote:
+                    i += 1
+                else:
+                    quote = None
+            elif char == "\\":
+                i += 1
+        elif char in ("'", '"', "`"):
+            quote = char
+        elif char == ";":
+            statement = sql[start:i].strip()
+            if statement:
+                statements.append(statement)
+            start = i + 1
+        i += 1
+
+    statement = sql[start:].strip()
+    if statement:
+        statements.append(statement)
+
+    return statements
+
+
+def canonical_table_name(name: str) -> str:
+    return name.strip("`").upper()
 
 
 def normalize_sql(text: str) -> str:
@@ -230,6 +328,97 @@ def validate_routine(path: Path, sql: str, errors: list[str]) -> None:
             errors.append(f"{path}: commented-out SQL code is not allowed")
             break
 
+def validate_dml(path: Path, sql: str, errors: list[str]) -> None:
+    relative = path.relative_to(ROOT)
+    parts = relative.parts
+
+    if len(parts) != 4 or parts[0:2] != ("BigQuery", "DML"):
+        errors.append(
+            f"{relative}: DML files must be located at "
+            "BigQuery/DML/MMDDYYYY/<file>.sql"
+        )
+        return
+
+    folder_date = parts[2]
+    if not re.fullmatch(r"\d{8}", folder_date):
+        errors.append(
+            f"{relative}: DML folder must use MMDDYYYY, for example 10182026"
+        )
+        return
+
+    try:
+        datetime.strptime(folder_date, "%m%d%Y")
+    except ValueError:
+        errors.append(
+            f"{relative}: {folder_date} is not a valid calendar date in MMDDYYYY format"
+        )
+        return
+
+    statements = split_sql_statements(strip_sql_comments(sql))
+    backups: list[tuple[str, str]] = []
+    used_backups: set[int] = set()
+    mutation_count = 0
+
+    for statement in statements:
+        backup_match = BACKUP_RE.search(statement)
+        if backup_match:
+            backup_name = canonical_table_name(backup_match.group("backup"))
+            source_name = canonical_table_name(
+                backup_match.group("clone") or backup_match.group("source")
+            )
+            backup_parts = backup_name.split(".")
+            backup_table = backup_parts[-1]
+
+            if len(backup_parts) < 2 or backup_parts[-2] != "DP_BASE_BACKUP":
+                errors.append(
+                    f"{relative}: backup table {backup_name} must be in DP_BASE_BACKUP"
+                )
+                continue
+
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]*_BKP_[A-Z0-9_-]+", backup_table):
+                errors.append(
+                    f"{relative}: backup table must follow "
+                    "DP_BASE_BACKUP.<TABLE_NAME>_BKP_<DATE>"
+                )
+                continue
+
+            backups.append((backup_name, source_name))
+            continue
+
+        mutation_match = MUTATION_RE.match(statement)
+        if not mutation_match:
+            continue
+
+        mutation_count += 1
+        operation = " ".join(mutation_match.group("operation").upper().split())
+        target_name = canonical_table_name(mutation_match.group("target"))
+        target_table = target_name.split(".")[-1]
+        matching_backup_index: int | None = None
+
+        for index, (backup_name, source_name) in enumerate(backups):
+            backup_table = backup_name.split(".")[-1]
+            if (
+                index not in used_backups
+                and source_name == target_name
+                and backup_table.startswith(f"{target_table}_BKP_")
+            ):
+                matching_backup_index = index
+                break
+
+        if matching_backup_index is None:
+            errors.append(
+                f"{relative}: {operation} on {target_name} requires a preceding "
+                "backup in DP_BASE_BACKUP, named "
+                f"{target_table}_BKP_<DATE>, created from that same target"
+            )
+        else:
+            used_backups.add(matching_backup_index)
+
+    if mutation_count == 0:
+        errors.append(
+            f"{relative}: no supported DML/DDL mutation found "
+            "(UPDATE, DELETE, TRUNCATE, INSERT, MERGE, or ALTER)"
+        )
 
 def changed_files(base: str, head: str) -> list[Path]:
     if re.fullmatch(r"0+", base):
@@ -310,6 +499,9 @@ def main() -> int:
         elif len(parts) == 4 and parts[2] == "ROUTINES":
             validate_routine(path, sql, errors)
             asset_type = "BigQuery routine"
+        elif len(parts) == 4 and parts[1] == "DML":
+            validate_dml(path, sql, errors)
+            asset_type = "BigQuery DML"
         else:
             errors.append(
                 f"{relative}: SQL file is not in a recognized BigQuery asset directory"

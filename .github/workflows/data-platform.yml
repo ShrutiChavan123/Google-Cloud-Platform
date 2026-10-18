@@ -2,13 +2,6 @@ name: Data platform CI/CD
 
 on:
   pull_request:
-    paths:
-      - "BigQuery/**"
-      - "DataProc/**"
-      - "dags/**"
-      - "scripts/**"
-      - ".github/workflows/data-platform.yml"
-  push:
     branches:
       - master
     paths:
@@ -26,9 +19,10 @@ jobs:
     name: Validate changed files
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
+      - name: Check out PR code
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -38,23 +32,24 @@ jobs:
 
       - name: Validate changed files
         env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: python scripts/validate_changed_assets.py "$BASE_SHA" "$HEAD_SHA"
 
   deploy-dev:
     name: Deploy changed assets to development
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: validate
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     environment: development
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Check out repository history
+      - name: Check out PR code
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Authenticate to Google Cloud
@@ -68,59 +63,66 @@ jobs:
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      - name: Deploy changed BigQuery assets
+      - name: Install BigQuery client
+        run: python -m pip install google-cloud-bigquery
+
+      - name: Deploy changed BigQuery SQL
         env:
-          BASE_SHA: ${{ github.event.before }}
-          HEAD_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          PYTHONUNBUFFERED: "1"
         shell: bash
-        run: |
-          set -euo pipefail
+        run: python scripts/deploy_bigquery.py "$BASE_SHA" "$HEAD_SHA"
 
-          if [[ -z "$GCP_PROJECT_ID" ]]; then
-            echo "::error::Set the GCP_PROJECT_ID environment variable."
-            exit 1
-          fi
+      # - name: Deploy changed BigQuery SQL
+      #   env:
+      #     BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      #     HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      #     GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      #     PYTHONUNBUFFERED: "1"
+      #   run: python scripts/deploy_bigquery.py "$BASE_SHA" "$HEAD_SHA"
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
 
-          if [[ "$BASE_SHA" =~ ^0+$ ]]; then
-            echo "::error::Cannot determine changed files for this initial push. Merge a follow-up change to deploy."
-            exit 1
-          fi
+      #     mapfile -t changed_sql < <(
+      #       git diff --name-only --diff-filter=ACMR \
+      #         "$BASE_SHA...$HEAD_SHA" -- BigQuery |
+      #         grep -E '\.sql$' || true
+      #     )
 
-          mapfile -t changed_sql < <(
-            git diff --name-only --diff-filter=ACMR "$BASE_SHA...$HEAD_SHA" -- BigQuery |
-              grep -E '\.sql$' || true
-          )
+      #     deploy_category() {
+      #       local category="$1"
+      #       local file
 
-          deploy_category() {
-            local category="$1"
-            local file
+      #       for file in "${changed_sql[@]}"; do
+      #         case "$category:$file" in
+      #           dataset:BigQuery/DATASETS/*.sql) ;;
+      #           table:BigQuery/*/TABLES/*.sql) ;;
+      #           view:BigQuery/*/VIEWS/*.sql) ;;
+      #           routine:BigQuery/*/ROUTINES/*.sql) ;;
+      #           *) continue ;;
+      #         esac
 
-            for file in "${changed_sql[@]}"; do
-              case "$category:$file" in
-                dataset:BigQuery/DATASETS/*.sql) ;;
-                table:BigQuery/*/TABLES/*.sql) ;;
-                view:BigQuery/*/VIEWS/*.sql) ;;
-                routine:BigQuery/*/ROUTINES/*.sql) ;;
-                *) continue ;;
-              esac
+      #         echo "Deploying $file to ${GCP_PROJECT_ID}"
+      #         bq query \
+      #           --project_id="$GCP_PROJECT_ID" \
+      #           --use_legacy_sql=false \
+      #           < "$file"
+      #       done
+      #     }
 
-              echo "Deploying $file"
-              bq query \
-                --project_id="$GCP_PROJECT_ID" \
-                --use_legacy_sql=false \
-                < "$file"
-            done
-          }
+      #     deploy_category dataset
+      #     deploy_category table
+      #     deploy_category view
+      #     deploy_category routine
 
-          deploy_category dataset
-          deploy_category table
-          deploy_category view
-          deploy_category routine
-
-      - name: Sync Composer DAGs when present
+      - name: Upload changed DAG files
         if: ${{ hashFiles('dags/**/*.py') != '' }}
         env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           COMPOSER_DAGS_BUCKET: ${{ vars.COMPOSER_DAGS_BUCKET }}
         shell: bash
         run: |
@@ -131,4 +133,34 @@ jobs:
             exit 1
           fi
 
-          gcloud storage rsync --recursive dags "gs://${COMPOSER_DAGS_BUCKET}"
+          mapfile -t changed_dags < <(
+            git diff --name-only --diff-filter=ACMR \
+              "$BASE_SHA...$HEAD_SHA" -- dags |
+              grep -E '\.py$' || true
+          )
+
+          for file in "${changed_dags[@]}"; do
+            destination="gs://${COMPOSER_DAGS_BUCKET}/dags/${file#dags/}"
+            echo "Uploading $file to $destination"
+            gcloud storage cp "$file" "$destination"
+          done
+
+  auto-merge:
+    name: Auto-merge after validation and deployment
+    needs:
+      - validate
+      - deploy-dev
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      needs.validate.result == 'success' &&
+      needs.deploy-dev.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr merge "$PR_NUMBER" --auto --squash
