@@ -1,218 +1,106 @@
-#!/usr/bin/env python3
-"""Validate BigQuery naming and metadata conventions for repository SQL."""
-
 from __future__ import annotations
 
-import re
+import os
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
+from google.api_core.exceptions import GoogleAPICallError
+from google.cloud import bigquery
 
 ROOT = Path(__file__).resolve().parents[1]
-BIGQUERY_DIR = ROOT / "BigQuery"
-DATASETS_DIR = BIGQUERY_DIR / "DATASETS"
-IDENTIFIER = re.compile(r"^[A-Z][A-Z0-9_]*$")
-TABLE_PATTERN = re.compile(
-    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:EXTERNAL\s+)?TABLE\s+"
-    r"(?:IF\s+NOT\s+EXISTS\s+)?(`?[\w.-]+`?)",
-    re.IGNORECASE,
-)
-ROUTINE_PATTERN = re.compile(
-    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:PROCEDURE|FUNCTION)\s+"
-    r"(`?[\w.-]+`?)",
-    re.IGNORECASE,
-)
-SCHEMA_PATTERN = re.compile(
-    r"\bCREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+([A-Za-z0-9_]+)",
-    re.IGNORECASE,
-)
+ASSET_ORDER = ("DATASETS", "TABLES", "VIEWS", "ROUTINES", "MIGRATIONS")
 
 
-def normalize_sql(text: str) -> str:
-    return text.translate(
-        str.maketrans(
-            {
-                "\u00a0": " ",
-                "\u2007": " ",
-                "\u202f": " ",
-            }
-        )
+def log(message: str) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
+def get_changed_sql(base_sha: str, head_sha: str) -> list[Path]:
+    result = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--name-only",
+            "--diff-filter=ACMR",
+            f"{base_sha}...{head_sha}",
+            "--",
+            "BigQuery",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
     )
 
+    paths = [ROOT / name for name in result.stdout.splitlines() if name.endswith(".sql")]
 
-def split_top_level(text: str) -> list[str]:
-    parts: list[str] = []
-    start = 0
-    parens = 0
-    angles = 0
-    quote: str | None = None
-    index = 0
+    def category_order(path: Path) -> int:
+        try:
+            return ASSET_ORDER.index(path.relative_to(ROOT).parts[2])
+        except (ValueError, IndexError):
+            return len(ASSET_ORDER)
 
-    while index < len(text):
-        char = text[index]
-        if quote:
-            if char == quote:
-                if index + 1 < len(text) and text[index + 1] == quote:
-                    index += 1
-                else:
-                    quote = None
-        elif char in ("'", '"', "`"):
-            quote = char
-        elif char == "(":
-            parens += 1
-        elif char == ")":
-            parens -= 1
-        elif char == "<":
-            angles += 1
-        elif char == ">":
-            angles = max(0, angles - 1)
-        elif char == "," and parens == 0 and angles == 0:
-            parts.append(text[start:index])
-            start = index + 1
-        index += 1
-
-    parts.append(text[start:])
-    return parts
-
-
-def find_matching_paren(text: str, open_index: int) -> int | None:
-    depth = 0
-    quote: str | None = None
-    index = open_index
-
-    while index < len(text):
-        char = text[index]
-        if quote:
-            if char == quote:
-                if index + 1 < len(text) and text[index + 1] == quote:
-                    index += 1
-                else:
-                    quote = None
-        elif char in ("'", '"', "`"):
-            quote = char
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return index
-        index += 1
-    return None
-
-
-def object_name(qualified_name: str) -> str:
-    return qualified_name.strip("`").split(".")[-1]
-
-
-def validate_dataset(path: Path, errors: list[str]) -> str | None:
-    sql = normalize_sql(path.read_text(encoding="utf-8-sig"))
-    match = SCHEMA_PATTERN.search(sql)
-    if not match:
-        errors.append(f"{path.relative_to(ROOT)}: expected CREATE SCHEMA IF NOT EXISTS")
-        return None
-
-    name = match.group(1)
-    if not IDENTIFIER.fullmatch(name):
-        errors.append(f"{path.relative_to(ROOT)}: dataset name {name!r} must be uppercase")
-    if name != path.stem:
-        errors.append(f"{path.relative_to(ROOT)}: dataset name must match file name {path.stem!r}")
-    options = sql[match.end() :]
-    if not re.search(r"\blocation\s*=\s*['\"]us-central1['\"]", options, re.IGNORECASE):
-        errors.append(f"{path.relative_to(ROOT)}: dataset location must be us-central1")
-    if not re.search(r"\bdescription\s*=\s*['\"][^'\"]+['\"]", options, re.IGNORECASE):
-        errors.append(f"{path.relative_to(ROOT)}: dataset description is required")
-    return name
-
-
-def validate_table(path: Path, errors: list[str]) -> str | None:
-    sql = normalize_sql(path.read_text(encoding="utf-8-sig"))
-    match = TABLE_PATTERN.search(sql)
-    relative = path.relative_to(ROOT)
-    if not match:
-        errors.append(f"{relative}: expected a CREATE TABLE statement")
-        return None
-
-    name = object_name(match.group(1))
-    if not IDENTIFIER.fullmatch(name):
-        errors.append(f"{relative}: table name {name!r} must be uppercase")
-    if name != path.stem:
-        errors.append(f"{relative}: table name must match file name {path.stem!r}")
-    declaration = sql[match.start() : match.end()]
-    if re.search(r"\bCREATE\s+OR\s+REPLACE\s+TABLE\b", declaration, re.IGNORECASE):
-        errors.append(
-            f"{relative}: CREATE OR REPLACE TABLE can overwrite stored data; use a reviewed migration"
-        )
-
-    open_index = sql.find("(", match.end())
-    if open_index < 0:
-        errors.append(f"{relative}: table column schema is required")
-        return name
-    close_index = find_matching_paren(sql, open_index)
-    if close_index is None:
-        errors.append(f"{relative}: could not parse table column schema")
-        return name
-
-    columns = split_top_level(sql[open_index + 1 : close_index])
-    for column in columns:
-        column = column.strip()
-        column_match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s+", column)
-        if not column_match:
-            errors.append(f"{relative}: could not identify a column in {column[:50]!r}")
-            continue
-        column_name = column_match.group(1)
-        if not IDENTIFIER.fullmatch(column_name):
-            errors.append(f"{relative}: column name {column_name!r} must be uppercase")
-        if not re.search(r"\bOPTIONS\s*\(.*?\bdescription\s*=", column, re.IGNORECASE | re.DOTALL):
-            errors.append(f"{relative}: column {column_name} requires a description")
-
-    table_options = sql[close_index + 1 :]
-    if not re.search(r"\bOPTIONS\s*\(.*?\bdescription\s*=", table_options, re.IGNORECASE | re.DOTALL):
-        errors.append(f"{relative}: table description is required in OPTIONS")
-    return name
-
-
-def validate_routine(path: Path, errors: list[str]) -> None:
-    sql = normalize_sql(path.read_text(encoding="utf-8-sig"))
-    match = ROUTINE_PATTERN.search(sql)
-    relative = path.relative_to(ROOT)
-    if not match:
-        errors.append(f"{relative}: expected a CREATE PROCEDURE or CREATE FUNCTION statement")
-        return
-    name = object_name(match.group(1))
-    if not IDENTIFIER.fullmatch(name):
-        errors.append(f"{relative}: routine name {name!r} must be uppercase")
-    if name != path.stem:
-        errors.append(f"{relative}: routine name must match file name {path.stem!r}")
+    return sorted(paths, key=category_order)
 
 
 def main() -> int:
-    errors: list[str] = []
-    dataset_names = {
-        name
-        for path in sorted(DATASETS_DIR.glob("*.sql"))
-        if (name := validate_dataset(path, errors)) is not None
-    }
+    if len(sys.argv) != 3:
+        log("ERROR: Usage: deploy_bigquery.py BASE_SHA HEAD_SHA")
+        return 2
 
-    table_files = sorted(BIGQUERY_DIR.glob("*/TABLES/*.sql"))
-    routine_files = sorted(BIGQUERY_DIR.glob("*/ROUTINES/*.sql"))
-    required_datasets = {path.parent.parent.name for path in table_files + routine_files}
-    for dataset in sorted(required_datasets - dataset_names):
-        errors.append(f"BigQuery/DATASETS: missing dataset definition for {dataset}")
-
-    for path in table_files:
-        validate_table(path, errors)
-    for path in routine_files:
-        validate_routine(path, errors)
-
-    if errors:
-        print("BigQuery standards validation failed:", file=sys.stderr)
-        for error in errors:
-            print(f"- {error}", file=sys.stderr)
+    project_id = os.environ.get("GCP_PROJECT_ID")
+    if not project_id:
+        log("ERROR: GCP_PROJECT_ID is not set.")
         return 1
-    print(
-        f"BigQuery standards validation passed "
-        f"({len(dataset_names)} datasets, {len(table_files)} tables, {len(routine_files)} routines)."
-    )
+
+    try:
+        sql_files = get_changed_sql(sys.argv[1], sys.argv[2])
+    except subprocess.CalledProcessError as exc:
+        log(f"ERROR: Could not determine changed SQL files: {exc.stderr.strip()}")
+        return 1
+
+    if not sql_files:
+        log("No changed BigQuery SQL files to deploy.")
+        return 0
+
+    client = bigquery.Client(project=project_id)
+    log(f"Starting deployment of {len(sql_files)} changed SQL file(s) to {project_id}.")
+
+    for path in sql_files:
+        relative_path = path.relative_to(ROOT)
+        log(f"Deploying {relative_path} ...")
+
+        try:
+            sql = path.read_text(encoding="utf-8-sig")
+            job = client.query(sql, location="us-central1")
+            job.result()
+
+            log(f"SUCCESS: {relative_path}")
+            log(f"  BigQuery job ID: {job.job_id}")
+            log(f"  Statement type: {job.statement_type or 'unknown'}")
+
+            if job.num_dml_affected_rows is not None:
+                log(f"  Rows modified: {job.num_dml_affected_rows}")
+
+            if job.ddl_operation_performed:
+                log(f"  DDL operation: {job.ddl_operation_performed}")
+                if job.ddl_target_table:
+                    log(f"  DDL target table: {job.ddl_target_table}")
+                if job.ddl_target_routine:
+                    log(f"  DDL target routine: {job.ddl_target_routine}")
+
+            if job.total_bytes_processed is not None:
+                log(f"  Bytes processed: {job.total_bytes_processed}")
+
+        except (OSError, UnicodeError, GoogleAPICallError) as exc:
+            log(f"FAILED: {relative_path}")
+            log(f"  Error: {exc}")
+            return 1
+
+    log(f"Deployment completed successfully ({len(sql_files)} SQL file(s)).")
     return 0
 
 
