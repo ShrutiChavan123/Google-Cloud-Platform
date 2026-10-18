@@ -158,7 +158,7 @@ jobs:
             gcloud storage cp "$file" "$destination"
           done
 
-  auto-merge:
+    auto-merge:
     name: Auto-merge after validation and deployment
     needs:
       - validate
@@ -172,8 +172,13 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
       - name: Enable auto-merge
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: gh pr merge "$PR_NUMBER" --auto --squash
+        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash
