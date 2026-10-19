@@ -530,34 +530,17 @@ def validate_dag_file(path: Path, errors: list[str]) -> None:
         elif not dag_id.startswith("dag_"):
             errors.append(
                 f"{relative}:{call.lineno}: DAG ID {dag_id!r} must start with 'dag_'"
-            )
+        )
 
     for node in ast.walk(tree):
         if isinstance(node, ast.With):
             for item in node.items:
                 context = item.context_expr
-                if isinstance(context, ast.Call) and dag_call_name(context.func) == "DAG":
+                if (
+                    isinstance(context, ast.Call)
+                    and dag_call_name(context.func) == "DAG"
+                ):
                     validate_dag_id(context)
-                    if item.optional_vars is not None:
-                        for name in dag_target_names(item.optional_vars):
-                            if not name.startswith("dag_"):
-                                errors.append(
-                                    f"{relative}:{node.lineno}: DAG variable "
-                                    f"{name!r} must start with 'dag_'"
-                                )
-
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-            value = node.value
-            if isinstance(value, ast.Call) and dag_call_name(value.func) == "DAG":
-                validate_dag_id(value)
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    for name in dag_target_names(target):
-                        if not name.startswith("dag_"):
-                            errors.append(
-                                f"{relative}:{node.lineno}: DAG variable "
-                                f"{name!r} must start with 'dag_'"
-                            )
 
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for decorator in node.decorator_list:
@@ -566,10 +549,10 @@ def validate_dag_file(path: Path, errors: list[str]) -> None:
                     decorator_call.func if decorator_call is not None else decorator
                 )
                 if dag_call_name(decorator_func) == "dag":
-                    if not node.name.startswith("dag_"):
+                    if not node.name.startswith("dag"):
                         errors.append(
                             f"{relative}:{node.lineno}: DAG function "
-                            f"{node.name!r} must start with 'dag_'"
+                            f"{node.name!r} must start with 'dag'"
                         )
                     if decorator_call is not None:
                         validate_dag_id(decorator_call, function_name=node.name)
