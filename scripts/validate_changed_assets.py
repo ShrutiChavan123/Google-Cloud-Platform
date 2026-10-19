@@ -5,6 +5,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+import ast
+import io
+import tokenize
 
 ROOT = Path(__file__).resolve().parents[1]
 IDENTIFIER = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -445,6 +448,150 @@ def validate_dml(path: Path, sql: str, errors: list[str]) -> None:
             f"{relative}: no supported DML/DDL mutation found "
             "(UPDATE, DELETE, TRUNCATE, INSERT, MERGE, or ALTER)"
         )
+def dag_target_names(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        names: list[str] = []
+        for item in node.elts:
+            names.extend(dag_target_names(item))
+        return names
+    return []
+
+
+def dag_call_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def validate_dag_file(path: Path, errors: list[str]) -> None:
+    relative = path.relative_to(ROOT)
+
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(relative))
+    except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+        errors.append(f"{relative}: Python syntax/indentation error: {exc}")
+        return
+
+    for line_number, line in enumerate(source.splitlines(), start=1):
+        indentation = line[: len(line) - len(line.lstrip(" \t"))]
+        if "\t" in indentation:
+            errors.append(
+                f"{relative}:{line_number}: indentation must use spaces, not tabs"
+            )
+        elif len(indentation) % 4:
+            errors.append(
+                f"{relative}:{line_number}: indentation must use multiples of 4 spaces"
+            )
+
+    constants: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            if isinstance(node.value.value, str):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        constants[target.id] = node.value.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            constants[node.target.id] = node.value.value
+
+    def string_value(node: ast.expr) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return constants.get(node.id)
+        return None
+
+    def validate_dag_id(call: ast.Call, function_name: str | None = None) -> None:
+        dag_id_node = next(
+            (keyword.value for keyword in call.keywords if keyword.arg == "dag_id"),
+            None,
+        )
+
+        call_name = dag_call_name(call.func)
+        if dag_id_node is None and call_name == "DAG" and call.args:
+            dag_id_node = call.args[0]
+
+        dag_id = string_value(dag_id_node) if dag_id_node is not None else function_name
+
+        if dag_id is None:
+            errors.append(
+                f"{relative}:{call.lineno}: DAG ID must be a string literal "
+                "or a string constant so the dag_ prefix can be checked"
+            )
+        elif not dag_id.startswith("dag_"):
+            errors.append(
+                f"{relative}:{call.lineno}: DAG ID {dag_id!r} must start with 'dag_'"
+            )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.With):
+            for item in node.items:
+                context = item.context_expr
+                if isinstance(context, ast.Call) and dag_call_name(context.func) == "DAG":
+                    validate_dag_id(context)
+                    if item.optional_vars is not None:
+                        for name in dag_target_names(item.optional_vars):
+                            if not name.startswith("dag_"):
+                                errors.append(
+                                    f"{relative}:{node.lineno}: DAG variable "
+                                    f"{name!r} must start with 'dag_'"
+                                )
+
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if isinstance(value, ast.Call) and dag_call_name(value.func) == "DAG":
+                validate_dag_id(value)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    for name in dag_target_names(target):
+                        if not name.startswith("dag_"):
+                            errors.append(
+                                f"{relative}:{node.lineno}: DAG variable "
+                                f"{name!r} must start with 'dag_'"
+                            )
+
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                decorator_call = decorator if isinstance(decorator, ast.Call) else None
+                decorator_func = (
+                    decorator_call.func if decorator_call is not None else decorator
+                )
+                if dag_call_name(decorator_func) == "dag":
+                    if not node.name.startswith("dag_"):
+                        errors.append(
+                            f"{relative}:{node.lineno}: DAG function "
+                            f"{node.name!r} must start with 'dag_'"
+                        )
+                    if decorator_call is not None:
+                        validate_dag_id(decorator_call, function_name=node.name)
+
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.INDENT:
+                if "\t" in token.string or len(token.string) % 4:
+                    errors.append(
+                        f"{relative}:{token.start[0]}: block indentation must use "
+                        "multiples of 4 spaces"
+                    )
+
+            if token.type == tokenize.COMMENT:
+                comment = token.string[1:].strip()
+                if not re.fullmatch(r"[A-Za-z][A-Za-z ,'-]*[.!?]", comment):
+                    errors.append(
+                        f"{relative}:{token.start[0]}: comments must be one plain "
+                        "English sentence; commented-out code is not allowed"
+                    )
+    except (tokenize.TokenError, IndentationError) as exc:
+        errors.append(f"{relative}: tokenization/indentation error: {exc}")
 
 def changed_files(base: str, head: str) -> list[Path]:
     if re.fullmatch(r"0+", base):
@@ -460,7 +607,7 @@ def changed_files(base: str, head: str) -> list[Path]:
             "--",
             "BigQuery",
             "DataProc",
-            "dags",
+            "Composer/dags",
         ],
         cwd=ROOT,
         check=True,
@@ -495,13 +642,19 @@ def main() -> int:
         relative = path.relative_to(ROOT)
         if path.suffix == ".py":
             error_count = len(errors)
-            try:
-                compile(path.read_text(encoding="utf-8"), str(relative), "exec")
-            except (SyntaxError, UnicodeDecodeError) as exc:
-                errors.append(f"{relative}: Python validation failed: {exc}")
+
+            if relative.parts[:2] == ("Composer", "dags"):
+                validate_dag_file(path, errors)
+                asset_type = "Airflow DAG"
+            else:
+                try:
+                    compile(path.read_text(encoding="utf-8"), str(relative), "exec")
+                except (SyntaxError, UnicodeDecodeError) as exc:
+                    errors.append(f"{relative}: Python validation failed: {exc}")
+                asset_type = "Python"
 
             if len(errors) == error_count:
-                report_validated(relative, "Python")
+                report_validated(relative, asset_type)
             validated += 1
             continue
 
